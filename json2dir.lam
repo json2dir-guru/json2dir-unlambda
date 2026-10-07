@@ -1,0 +1,257 @@
+; json2dir evaluator in a small call-by-value lambda language, compiled to json2dir.unl
+; (Unlambda) by unlc.py. Reads the document byte by byte, checks strict UTF-8, parses and
+; validates the whole JSON document, then prints a POSIX sh script whose last line is
+; "# json2dir: end". On error it prints "json2dir: message" (no marker) and stops.
+
+; ---- Scott-encoded data ----
+(def true (fn (t f) (t unit)))
+(def false (fn (t f) (f unit)))
+(def nil (fn (n c) (n unit)))
+(def cons (fn (h t n c) (c h t)))
+(def pair (fn (a b f) (f a b)))
+(def none (fn (n s) (n unit)))
+(def some (fn (x n s) (s x)))
+(def fst (fn (p) (p (fn (a b) a))))
+
+; JSON nodes: (match node ((members) ...) ((bytes) file) ((bytes) link) ((bytes) script))
+(def obj (fn (m a b c d) (a m)))
+(def file (fn (s a b c d) (b s)))
+(def link (fn (s a b c d) (c s)))
+(def script (fn (s a b c d) (d s)))
+
+(primitive read-byte)   ; unit -> none | some byte  (decision tree of ?x tests)
+(primitive print-byte)  ; byte -> unit              (binary tree of .x on the bits)
+
+(def not (fn (a) (if a false true)))
+(def beq (fn (a b) (if a b (not b))))
+(def rev-onto (fn (xs acc) (match xs (() acc) ((h t) (rev-onto t (cons h acc))))))
+(def reverse (fn (xs) (rev-onto xs nil)))
+(def append (fn (xs ys) (rev-onto (reverse xs) ys)))
+
+; ---- bytes are lists of 8 booleans, most significant bit first ----
+(def lt (fn (a b)
+  (match a (() false) ((x xs) (match b (() false) ((y ys)
+    (if x (if y (lt xs ys) false) (if y true (lt xs ys)))))))))
+(def eqb (fn (a b)
+  (match a (() true) ((x xs) (match b (() true) ((y ys)
+    (if (beq x y) (eqb xs ys) false)))))))
+(def in-range (fn (x lo hi) (if (lt x lo) false (not (lt hi x)))))
+(def has (fn (s c) (match s (() false) ((x r) (if (eqb x c) true (has r c))))))
+(def str= (fn (a b)
+  (match a (() (match b (() true) ((y ys) false)))
+           ((x xs) (match b (() false) ((y ys) (if (eqb x y) (str= xs ys) false)))))))
+(def str< (fn (a b)
+  (match b (() false) ((y ys) (match a (() true) ((x xs)
+    (if (eqb x y) (str< xs ys) (lt x y))))))))
+
+(def read-all (fn (acc) (match (read-byte) (() (reverse acc)) ((b) (read-all (cons b acc))))))
+
+; ---- strict UTF-8 ----
+(def bad-utf8 (fn () (fail "input is not valid UTF-8")))
+(def cont-in (fn (xs lo hi) (match xs (() (bad-utf8)) ((x r) (if (in-range x lo hi) r (bad-utf8))))))
+(def cont (fn (xs) (cont-in xs 0x80 0xBF)))
+(def check-utf8 (fn (xs) (match xs (() unit) ((x r) (cond
+  ((lt x 0x80) (check-utf8 r))
+  ((lt x 0xC2) (bad-utf8))
+  ((lt x 0xE0) (check-utf8 (cont r)))
+  ((eqb x 0xE0) (check-utf8 (cont (cont-in r 0xA0 0xBF))))
+  ((eqb x 0xED) (check-utf8 (cont (cont-in r 0x80 0x9F))))
+  ((lt x 0xF0) (check-utf8 (cont (cont r))))
+  ((eqb x 0xF0) (check-utf8 (cont (cont (cont-in r 0x90 0xBF)))))
+  ((lt x 0xF4) (check-utf8 (cont (cont (cont r)))))
+  ((eqb x 0xF4) (check-utf8 (cont (cont (cont-in r 0x80 0x8F)))))
+  (else (bad-utf8)))))))
+
+; ---- JSON ----
+(def ws? (fn (x) (or (eqb x 32) (eqb x 10) (eqb x 9) (eqb x 13))))
+(def skip-ws (fn (xs) (match xs (() nil) ((x r) (if (ws? x) (skip-ws r) xs)))))
+
+; skips whitespace, then the byte c must follow; returns the rest
+(def expect (fn (xs c err) (match (skip-ws xs) (() (err)) ((x r) (if (eqb x c) r (err))))))
+
+; hex digit -> 4 bits
+(def hexlet (fn (l) (destr (a b c r) l
+  (if a (if b (bl 1 1 1 1) (if c (bl 1 1 1 0) (bl 1 1 0 1)))
+        (if b (if c (bl 1 1 0 0) (bl 1 0 1 1)) (bl 1 0 1 0))))))
+(def bad-hex (fn () (fail "invalid \\u escape")))
+(def hexval (fn (x) (cond
+  ((in-range x #\0 #\9) (destr (a b c d r) x r))
+  ((in-range x #\a #\f) (destr (a b c d e r) x (hexlet r)))
+  ((in-range x #\A #\F) (destr (a b c d e r) x (hexlet r)))
+  (else (bad-hex)))))
+(def hexd (fn (xs) (match xs (() (bad-hex)) ((x r) (pair (hexval x) r)))))
+; four hex digits -> pair(16 bits, rest)
+(def hex4 (fn (xs)
+  (match-pair (hexd xs) (a r1)
+  (match-pair (hexd r1) (b r2)
+  (match-pair (hexd r2) (c r3)
+  (match-pair (hexd r3) (d r4)
+  (pair (append a (append b (append c d))) r4)))))))
+
+(def hi-sur? (fn (cp) (destr (a b c d e f r) cp (and a b (not c) d e (not f)))))
+(def lo-sur? (fn (cp) (destr (a b c d e f r) cp (and a b (not c) d e f))))
+
+; push the UTF-8 bytes of a BMP code point (16 bits) onto a reversed byte list
+(def push-cp (fn (cp acc)
+  (destr (a b c d e f g h i j k l m n o p r) cp
+    (cond
+      ((or a b c d e)
+         (cons (bl 1 0 k l m n o p) (cons (bl 1 0 e f g h i j) (cons (bl 1 1 1 0 a b c d) acc))))
+      ((or f g h i)
+         (cons (bl 1 0 k l m n o p) (cons (bl 1 1 0 f g h i j) acc)))
+      (else (cons (bl 0 j k l m n o p) acc))))))
+
+; increment a list of bits: pair(carry, bits)
+(def inc (fn (bs) (match bs (() (pair true nil)) ((h t) (match-pair (inc t) (c r)
+  (if c (if h (pair true (cons false r)) (pair false (cons true r))) (pair false (cons h r))))))))
+
+; push the 4 UTF-8 bytes for a surrogate pair
+(def push-supp (fn (hi lo acc)
+  (destr (h1 h2 h3 h4 h5 h6 g h i j k l m n o p r) hi
+  (destr (l1 l2 l3 l4 l5 l6 G H I J K L M N O P r2) lo
+  (match-pair (inc (bl g h i j)) (q4 w)
+  (destr (q3 q2 q1 q0 r3) w
+    (cons (bl 1 0 K L M N O P)
+    (cons (bl 1 0 o p G H I J)
+    (cons (bl 1 0 q1 q0 k l m n)
+    (cons (bl 1 1 1 1 0 q4 q3 q2) acc))))))))))
+
+(def bad-sur (fn () (fail "unpaired surrogate escape")))
+(def unterminated (fn () (fail "unterminated string")))
+
+; after a backslash: pair(new reversed accumulator, rest)
+(def pesc (fn (xs acc) (match xs (() (unterminated)) ((c r) (cond
+  ((eqb c 34) (pair (cons c acc) r))
+  ((eqb c 92) (pair (cons c acc) r))
+  ((eqb c 47) (pair (cons c acc) r))
+  ((eqb c #\b) (pair (cons 8 acc) r))
+  ((eqb c #\f) (pair (cons 12 acc) r))
+  ((eqb c #\n) (pair (cons 10 acc) r))
+  ((eqb c #\r) (pair (cons 13 acc) r))
+  ((eqb c #\t) (pair (cons 9 acc) r))
+  ((eqb c #\u) (match-pair (hex4 r) (cp r3) (cond
+     ((lo-sur? cp) (bad-sur))
+     ((hi-sur? cp)
+        (match r3 (() (bad-sur)) ((x1 r4) (if (eqb x1 92)
+          (match r4 (() (bad-sur)) ((x2 r5) (if (eqb x2 #\u)
+            (match-pair (hex4 r5) (lo r6) (if (lo-sur? lo) (pair (push-supp cp lo acc) r6) (bad-sur)))
+            (bad-sur))))
+          (bad-sur)))))
+     (else (pair (push-cp cp acc) r3)))))
+  (else (fail "invalid escape in string")))))))
+
+; after the opening quote: pair(bytes, rest)
+(def pstr (fn (xs acc) (match xs (() (unterminated)) ((x r) (cond
+  ((eqb x 34) (pair (reverse acc) r))
+  ((eqb x 92) (match-pair (pesc r acc) (acc2 r2) (pstr r2 acc2)))
+  ((lt x 32) (fail "control character in string"))
+  (else (pstr r (cons x acc))))))))
+
+(def expect-str (fn (xs err) (pstr (expect xs 34 err) nil)))
+
+(def check-name (fn (s) (cond
+  ((str= s "") (fail "a name cannot be empty"))
+  ((str= s ".") (fail "a name cannot be . or .."))
+  ((str= s "..") (fail "a name cannot be . or .."))
+  ((has s #\/) (fail "a name cannot contain /"))
+  ((has s 0) (fail "a name cannot contain NUL"))
+  (else unit))))
+
+(def bad-array (fn () (fail "an array must be [link, target] or [script, content]")))
+(def parray (fn (xs)
+  (match-pair (expect-str xs bad-array) (kind r1)
+  (match-pair (expect-str (expect r1 #\, bad-array) bad-array) (payload r2)
+  (let ((r3 (expect r2 #\] bad-array)))
+    (cond
+      ((str= kind "link") (cond
+         ((has payload 0) (fail "a link target cannot contain NUL"))
+         ((str= payload "") (fail "a link target cannot be empty"))
+         (else (pair (link payload) r3))))
+      ((str= kind "script") (pair (script payload) r3))
+      (else (bad-array))))))))
+
+; stable insertion by name bytes: equal names stay in document order
+(def insert (fn (m sorted) (match sorted (() (cons m nil)) ((e rest)
+  (if (str< (fst m) (fst e)) (cons m sorted) (cons e (insert m rest)))))))
+
+(def bad-name (fn () (fail "expected a string")))
+(def bad-colon (fn () (fail "expected :")))
+(def bad-sep (fn () (fail "expected , or }")))
+(def pmembers (fn (pv xs acc)
+  (match-pair (expect-str xs bad-name) (name r1)
+    (check-name name)
+    (match-pair (pv (expect r1 #\: bad-colon)) (node r2)
+      (let ((acc2 (insert (pair name node) acc)))
+        (match (skip-ws r2) (() (bad-sep)) ((x r3) (cond
+          ((eqb x #\,) (pmembers pv r3 acc2))
+          ((eqb x #\}) (pair (obj acc2) r3))
+          (else (bad-sep))))))))))
+
+(def bad-end (fn () (fail "unexpected end of input")))
+(def pvalue (fn (xs) (match (skip-ws xs) (() (bad-end)) ((x r) (cond
+  ((eqb x 34) (match-pair (pstr r nil) (s r2) (pair (file s) r2)))
+  ((eqb x #\[) (parray r))
+  ((eqb x #\{) (match (skip-ws r) (() (bad-end)) ((y r2)
+     (if (eqb y #\}) (pair (obj nil) r2) (pmembers pvalue r nil)))))
+  (else (fail "only objects, strings and [kind, payload] arrays are allowed")))))))
+
+; ---- shell output ----
+(def put-q (fn (x) (cond
+  ((eqb x 39) (print "'\\''"))
+  ((eqb x 0) (print "' '"))     ; NUL splits the content into separate words
+  (else (print-byte x)))))
+(def put-bytes (fn (s) (match s (() unit) ((x r) (begin (put-q x) (put-bytes r))))))
+(def put-word (fn (s) (begin (print "'") (put-bytes s) (print "'"))))
+(def put-parts (fn (p) (match p (() unit) ((n r)
+  (begin (put-bytes n) (match r (() unit) ((n2 r2) (begin (print "/") (put-parts r)))))))))
+(def put-path (fn (p) (begin (print "'") (put-parts p) (print "'"))))
+
+(def emit-members (fn (path ms) (match ms (() unit) ((m rest) (begin
+  ; duplicate names: the last occurrence wins
+  (if (match rest (() false) ((m2 r2) (str= (fst m) (fst m2)))) unit
+    (match-pair m (name node)
+      (let ((p (append path (cons name nil))))
+        (match node
+          ((sub) (begin (print "_j2d_dir ") (put-path p) (print "\n") (emit-members p sub)))
+          ((s) (begin (print "_j2d_file ") (put-path p) (print " ") (put-word s) (print "\n")))
+          ((s) (begin (print "_j2d_link ") (put-path p) (print " ") (put-word s) (print "\n")))
+          ((s) (begin (print "_j2d_script ") (put-path p) (print " ") (put-word s) (print "\n")))))))
+  (emit-members path rest))))))
+
+(def helpers (fn () (begin
+  (print "set -eu\n")
+  (print "_j2d_fail() { printf 'json2dir: cannot create %s\\n' \"$1\" >&2; exit 1; }\n")
+  (print "# Remove an existing non-directory (a symlink itself, never its target);\n")
+  (print "# a real directory in the way of a non-object is an error.\n")
+  (print "_j2d_clear() {\n")
+  (print "  if [ -L \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n")
+  (print "  elif [ -d \"$1\" ]; then printf 'json2dir: a directory is in the way: %s\\n' \"$1\" >&2; exit 1\n")
+  (print "  elif [ -e \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n")
+  (print "  fi\n")
+  (print "}\n")
+  (print "_j2d_dir() {\n")
+  (print "  if [ -L \"$1\" ] || { [ -e \"$1\" ] && [ ! -d \"$1\" ]; }; then rm -f -- \"$1\" || _j2d_fail \"$1\"; fi\n")
+  (print "  if [ ! -d \"$1\" ]; then mkdir -- \"$1\" || _j2d_fail \"$1\"; fi\n")
+  (print "}\n")
+  (print "# _j2d_file path part...: the content is the parts joined by NUL bytes.\n")
+  (print "_j2d_file() {\n")
+  (print "  _j2d_clear \"$1\"\n")
+  (print "  _j2d_path=$1; shift\n")
+  (print "  {\n")
+  (print "    printf '%s' \"$1\"; shift\n")
+  (print "    for _j2d_part in \"$@\"; do printf '\\000%s' \"$_j2d_part\"; done\n")
+  (print "  } > \"$_j2d_path\" || _j2d_fail \"$_j2d_path\"\n")
+  (print "}\n")
+  (print "_j2d_script() { _j2d_file \"$@\"; chmod a+x -- \"$1\" || _j2d_fail \"$1\"; }\n")
+  (print "_j2d_link() { _j2d_clear \"$1\"; ln -s -- \"$2\" \"$1\" || _j2d_fail \"$1\"; }\n"))))
+
+(main
+  (let ((xs (read-all nil)))
+    (check-utf8 xs)
+    (match (skip-ws xs) (() (fail "the document is empty")) ((x r)
+      (if (eqb x #\{) unit (fail "the root of the document must be an object"))))
+    (match-pair (pvalue xs) (root rest)
+      (match (skip-ws rest) (() unit) ((x r) (fail "trailing data after the JSON value")))
+      (helpers)
+      (match root ((ms) (emit-members nil ms)) ((s) unit) ((s) unit) ((s) unit))
+      (print "# json2dir: end\n"))))

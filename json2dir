@@ -1,0 +1,45 @@
+#!/bin/sh
+# The Unlambda evaluator (json2dir.unl, generated from json2dir.lam by unlc.py) owns UTF-8
+# checking, JSON parsing, validation and shell generation; this launcher only moves bytes
+# and runs the generated script.
+#
+# The interpreter (Madore's official OCaml one) reads the program from stdin and gives the
+# program everything after it as input, so the document is sent right after json2dir.unl.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+if ! (
+  umask 077
+  cat "$script_dir/json2dir.unl" "$task_tmp/input.json" \
+    | "${JSON2DIR_UNLAMBDA:-unlambda}" > "$task_tmp/tree.sh"
+); then
+  exit 1
+fi
+
+# The script is only run if the evaluator wrote its end marker as the last line;
+# otherwise its last line is its error message.
+last=$(tail -n 1 "$task_tmp/tree.sh")
+if [ "$last" != '# json2dir: end' ]; then
+  case $last in
+    'json2dir: '*) printf '%s\n' "$last" >&2 ;;
+    *) printf '%s\n' 'json2dir: the evaluator did not finish' >&2 ;;
+  esac
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"
